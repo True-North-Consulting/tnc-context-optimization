@@ -116,7 +116,41 @@ This reads the current project's transcripts and prints the cost per turn,
 the average context, the spend by context size, the peak context and the
 number of compactions. Costs are in relative units (input 1, cache read 0.1,
 output 5), so the comparison holds whatever the model's price. Sessions are
-counted by the day they started.
+counted by the day they started. Subagents get a line of their own, under the
+sessions that started them, and are not counted in the lines above it.
+
+## Subagents
+
+A subagent gets the same treatment as the main session, with a ledger of its
+own. This matters most for long subagents that are resumed with `SendMessage`
+for new tasks, and that compact on their own as their context fills.
+
+- When a subagent starts, and each time it is resumed, it is pointed at its
+  own ledger, `ledgers/<session>.<agent>.md`. Its Goal is its brief and every
+  message sent to it since.
+- Its tool batches get the same warning and reminders as the main session.
+  The window is the one it inherits, or the lower `autoCompactWindow` its
+  definition in `.claude/agents/` sets.
+- After it compacts, its ledger, its own record (its brief and messages, files
+  edited, last commands) and a search into its own transcript come back with
+  its next tool batch. Its first reply after the compaction still has only
+  the summary, and if that reply makes no tool call, nothing comes back.
+
+Claude Code runs `SessionStart` inside a subagent too, after its compaction,
+but that event names neither the subagent nor its transcript, so it looks
+exactly like the main session's. Before 2.1.0 it handed the subagent the main
+session's ledger. Now the plugin notes which subagents run (from
+`SubagentStart` to `SubagentStop`). While none runs, a compaction can only be
+the main session's, and its ledger comes back at once, as before. While one
+runs, `SessionStart` injects a short note instead: the main session is told
+where its ledger is and to read it before it continues, and a subagent is told
+the note is not for it. Whoever compacted then gets its full ledger and record
+with its next prompt or tool batch, which do name it.
+
+A subagent that ends without `SubagentStop` (killed, or a crash) stays marked
+as running until the session is resumed. Until then the main session gets the
+short note after a compaction, and its full ledger one prompt or tool batch
+later.
 
 ## What it runs, reads and writes
 
@@ -128,8 +162,12 @@ Everything stays on your machine. The plugin makes no network requests.
 
 - `SessionStart`: injects the ledger rule. After a compaction it also injects
   the ledger, the record and the search command, in under 10,000 characters.
+- `SubagentStart`: injects the ledger rule with the subagent's own ledger, and
+  notes the subagent as running. `SubagentStop` notes it stopped and injects
+  nothing.
 - `UserPromptSubmit` and `PostToolBatch`: injects a reminder or a warning when
-  one is due, and otherwise nothing.
+  one is due, and otherwise nothing. After a compaction `SessionStart` could
+  not restore, they inject what it would have.
 - The status line, if you set it up.
 
 To show the git state it runs `git branch --show-current`,
@@ -138,7 +176,11 @@ working directory.
 
 **Reads:**
 
-- the session transcript Claude Code passes to the hook;
+- the session transcript Claude Code passes to the hook, and for a subagent
+  its own transcript beside it (`<session>/subagents/agent-<id>.jsonl`);
+- when a subagent starts, the frontmatter of the agent definitions in
+  `.claude/agents/` in the project and in `~/.claude/agents/`, for its
+  `autoCompactWindow`;
 - the settings files Claude Code reads for `autoCompactWindow`: managed,
   `.claude/settings.local.json` and `.claude/settings.json` in the project,
   and `~/.claude/settings.json`;
@@ -151,8 +193,13 @@ the plugin and the marketplace it came from, for example
 `~/.claude/plugins/data/tnc-context-optimization-true-north-consulting/`;
 `/tnc-context-optimization:setup` prints the exact path:
 
-- `ledgers/<session>.md`, written by Claude, not by the plugin;
-- `state/<session>.json`, which reminders have been given;
+- `ledgers/<session>.md`, and `ledgers/<session>.<agent>.md` per subagent,
+  written by Claude, not by the plugin;
+- `state/<session>.json` and `state/<session>.<agent>.json`, which reminders
+  have been given;
+- `running/<session>.<agent>`, an empty file while that subagent runs;
+- `restored/<session>`, how many of the session's compactions it restored
+  right away;
 - `statusline.sh` and `rules.md`, rewritten at each session start when the
   installed version changed them.
 

@@ -12,7 +12,8 @@ files in its data directory. Claude Code names that directory after the
 plugin and the marketplace it came from, for example
 `~/.claude/plugins/data/tnc-context-optimization-true-north-consulting/`;
 `/tnc-context-optimization:setup` prints the exact path. It holds
-the ledger Claude writes and a small state file per session. These hold your
+the ledger Claude writes and a small state file per session and per subagent.
+These hold your
 own messages and file paths in plain text, so they can contain whatever you
 typed, including names or email addresses. Files untouched for 30 days are
 deleted at the start of a new session; you can delete the directory at any

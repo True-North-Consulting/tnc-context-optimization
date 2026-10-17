@@ -1,7 +1,7 @@
 {
   "name": "tnc-context-optimization",
   "displayName": "TNC Context Optimization",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Auto-compaction that keeps what matters: a session ledger and a verbatim record re-injected after every compaction, a warning before it, a search into the full transcript, and a statusline that shows how close the next compaction is.",
   "author": { "name": "True North Consulting" },
   "homepage": "https://github.com/True-North-Consulting/tnc-context-optimization",

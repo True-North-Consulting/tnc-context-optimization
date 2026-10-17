@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
 from conftest import BOUNDARY, assistant, user, write_transcript
 
-from tnc_context.transcript import TAIL_START, activity, grep, latest_call
+from tnc_context import HookError
+from tnc_context.transcript import (TAIL_START, activity, agent_transcript, boundaries_since, grep,
+                                    latest_call)
 
 
 def test_the_latest_main_thread_call_with_its_model(isolated):
@@ -83,3 +86,75 @@ def test_grep_caps_its_output(isolated):
 def test_grep_without_matches(isolated):
     transcript = write_transcript(isolated["tmp"] / "t.jsonl", [user("nothing")])
     assert grep(transcript, "absent", limit=5, width=10) == "no matches"
+
+
+def test_a_subagents_transcript_is_read_as_its_own_conversation(isolated):
+    transcript = write_transcript(isolated["tmp"] / "agent-a1.jsonl", [
+        user("Implement package B2", isSidechain=True),
+        assistant(40000, sidechain=True, tools=(("Edit", {"file_path": "/p/b2.py"}),)),
+        user("<system-reminder>harness notice</system-reminder>", isSidechain=True, isMeta=True),
+        user("The coordinator sent a message while you were working:\nRebase onto main",
+             isSidechain=True, isMeta=True),
+        assistant(45000, sidechain=True, model="claude-haiku-5-5"),
+    ])
+    assert latest_call(transcript) is None
+    assert latest_call(transcript, sidechain=True) == (45000, "claude-haiku-5-5")
+    done = activity(transcript, sidechain=True)
+    assert done.prompts == ["Implement package B2", "Rebase onto main"]
+    assert done.edited == ["/p/b2.py"]
+    assert activity(transcript).prompts == []
+
+
+def test_a_relayed_message_is_no_prompt_in_the_main_session(isolated):
+    transcript = write_transcript(isolated["tmp"] / "t.jsonl", [
+        user("The coordinator sent a message while you were working:\nhi", isMeta=True)])
+    assert activity(transcript).prompts == []
+
+
+def test_the_subagents_transcript_sits_beside_the_parents(isolated):
+    parent = isolated["tmp"] / "s1.jsonl"
+    own = isolated["tmp"] / "s1" / "subagents" / "agent-a1.jsonl"
+    event = {"transcript_path": str(parent), "agent_id": "a1"}
+    with pytest.raises(HookError, match="no transcript for subagent a1"):
+        agent_transcript(event)
+    own.parent.mkdir(parents=True)
+    write_transcript(own, [user("go", isSidechain=True)])
+    assert agent_transcript(event) == own
+    given = write_transcript(isolated["tmp"] / "elsewhere.jsonl", [])
+    assert agent_transcript(dict(event, agent_transcript_path=str(given))) == given
+
+
+def test_boundaries_since_reads_only_complete_lines(isolated):
+    import json
+    path = write_transcript(isolated["tmp"] / "t.jsonl", [assistant(1000)])
+    found, offset = boundaries_since(path, 0)
+    assert found == 0 and offset == path.stat().st_size
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(BOUNDARY)[:15])
+    assert boundaries_since(path, offset) == (0, offset)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(BOUNDARY)[15:] + "\n")
+    assert boundaries_since(path, offset) == (1, path.stat().st_size)
+
+
+def test_boundaries_since_skips_a_cut_line_and_a_rewritten_file(isolated):
+    import json
+    path = isolated["tmp"] / "t.jsonl"
+    path.write_text('{"type": "system", "subtype": "compact_boundary", "cut\n', encoding="utf-8")
+    assert boundaries_since(path, 0)[0] == 0
+    write_transcript(path, [BOUNDARY])
+    assert boundaries_since(path, 10_000) == (0, path.stat().st_size)  # rewritten: from here
+
+
+def test_boundaries_since_counts_only_this_conversations_boundaries(isolated):
+    path = write_transcript(isolated["tmp"] / "t.jsonl", [dict(BOUNDARY, isSidechain=True)])
+    assert boundaries_since(path, 0)[0] == 0  # a subagent's, written into the session's file
+    assert boundaries_since(path, 0, sidechain=True)[0] == 1
+    plain = write_transcript(isolated["tmp"] / "agent-a1.jsonl", [BOUNDARY])
+    assert boundaries_since(plain, 0, sidechain=True)[0] == 1  # its own file
+
+
+def test_a_subagents_boundary_in_the_sessions_file_does_not_hide_its_context(isolated):
+    path = write_transcript(isolated["tmp"] / "t.jsonl", [
+        assistant(120000), dict(BOUNDARY, isSidechain=True)])
+    assert latest_call(path).tokens == 120000

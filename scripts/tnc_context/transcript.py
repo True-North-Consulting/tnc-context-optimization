@@ -7,11 +7,16 @@ import re
 from pathlib import Path
 from typing import Iterator, NamedTuple, Optional
 
+from . import HookError
+
 # The transcript is read from its end; assistant records sit between tool
 # results that can be hundreds of KB (screenshots), so the window grows.
 TAIL_START = 512 * 1024
 TAIL_MAX = 16 * 1024 * 1024
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# A message sent to a running subagent reaches its transcript as a meta record
+# under this line, e.g. "The coordinator sent a message while you were working:".
+RELAYED = re.compile(r"\A[^\n]{1,120} sent a message while you were working:\n")
 
 
 class Call(NamedTuple):
@@ -40,9 +45,10 @@ def is_compact_boundary(record: dict) -> bool:
     return record.get("type") == "system" and record.get("subtype") == "compact_boundary"
 
 
-def latest_call(transcript: Path) -> Optional[Call]:
-    """The main conversation's latest API call: its context size and model.
+def latest_call(transcript: Path, sidechain: bool = False) -> Optional[Call]:
+    """The conversation's latest API call: its context size and model.
 
+    `sidechain` reads a subagent's own transcript, whose every record is one.
     None when nothing was called since the start or the last compaction.
     """
     size = transcript.stat().st_size
@@ -59,9 +65,9 @@ def latest_call(transcript: Path) -> Optional[Call]:
                 record = json.loads(line)
             except ValueError:
                 continue  # a record still being written
-            if is_compact_boundary(record):
+            if _our_boundary(record, sidechain):
                 return None
-            if (record.get("type") != "assistant" or record.get("isSidechain")
+            if (record.get("type") != "assistant" or not _ours(record, sidechain)
                     or record.get("isApiErrorMessage")):
                 continue  # a failed call's stand-in record carries zero usage
             message = record.get("message") or {}
@@ -83,9 +89,55 @@ def records(transcript: Path) -> Iterator[tuple]:
                 continue
 
 
-def prompt_text(record: dict) -> Optional[str]:
-    """What the user typed, for a record that is a real user prompt."""
-    if (record.get("type") != "user" or record.get("isSidechain") or record.get("isMeta")
+def agent_transcript(event: dict) -> Path:
+    """A subagent's own transcript; the hook event's `transcript_path` is the parent's."""
+    given = event.get("agent_transcript_path")
+    path = (Path(given) if given else Path(event["transcript_path"]).with_suffix("")
+            / "subagents" / f"agent-{event['agent_id']}.jsonl")
+    if not path.is_file():
+        raise HookError(f"no transcript for subagent {event['agent_id']}: {path}")
+    return path
+
+
+def _ours(record: dict, sidechain: bool) -> bool:
+    return bool(record.get("isSidechain")) == sidechain
+
+
+def boundaries_since(transcript: Path, offset: int, sidechain: bool = False) -> tuple:
+    """How many times this conversation compacted after byte `offset`,
+    and the offset to look from next time: the end of the last complete line."""
+    size = transcript.stat().st_size
+    if offset > size:
+        return 0, size  # rewritten since: count from here
+    with transcript.open("rb") as handle:
+        handle.seek(offset)
+        data = handle.read()
+    complete = data[:data.rfind(b"\n") + 1]  # the last line may be mid-write
+    found = 0
+    for line in complete.splitlines():
+        if b"compact_boundary" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue  # a line a crash cut short is no boundary
+        if _our_boundary(record, sidechain):
+            found += 1
+    return found, offset + len(complete)
+
+
+def _our_boundary(record: dict, sidechain: bool) -> bool:
+    """A compaction of this conversation: in a subagent's own file every one
+    is; in the session's, not one of a subagent written there."""
+    return is_compact_boundary(record) and (sidechain or not record.get("isSidechain"))
+
+
+def prompt_text(record: dict, sidechain: bool = False) -> Optional[str]:
+    """What the user typed, for a record that is a real user prompt.
+
+    In a subagent's transcript that is its brief and each message sent to it.
+    """
+    if (record.get("type") != "user" or not _ours(record, sidechain)
             or record.get("isCompactSummary")):
         return None
     content = (record.get("message") or {}).get("content")
@@ -97,20 +149,25 @@ def prompt_text(record: dict) -> Optional[str]:
     if not isinstance(content, str):
         return None
     text = content.strip()
+    if record.get("isMeta"):
+        relayed = RELAYED.match(text) if sidechain else None
+        if relayed is None:
+            return None
+        text = text[relayed.end():].strip()
     # Slash-command wrappers, command output and harness notices start with a tag.
     if not text or text.startswith("<") or text.startswith("[Request interrupted"):
         return None
     return text
 
 
-def activity(transcript: Path) -> Activity:
+def activity(transcript: Path, sidechain: bool = False) -> Activity:
     prompts, edited, commands = [], [], []
     for _, record in records(transcript):
-        text = prompt_text(record)
+        text = prompt_text(record, sidechain)
         if text is not None:
             prompts.append(text)
             continue
-        if record.get("type") != "assistant" or record.get("isSidechain"):
+        if record.get("type") != "assistant" or not _ours(record, sidechain):
             continue
         for block in (record.get("message") or {}).get("content") or []:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
