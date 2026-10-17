@@ -10,10 +10,15 @@ state outside the conversation, where compaction cannot touch it:
                  plugin's own verbatim record of the session (the user's
                  messages, files edited, last commands, git state) and the
                  command that searches the full pre-compaction transcript.
+  agent-start    SubagentStart hook, on a spawn and on every resume: points
+                 the subagent at a ledger of its own and marks it running.
+  agent-stop     SubagentStop hook: marks it stopped.
   watch          UserPromptSubmit / PostToolBatch hook. Before the compaction
                  point asks Claude to bring the ledger up to date, repeats it
                  once if ignored, and reminds it whenever the conversation has
-                 grown by 100k since the ledger was last written.
+                 grown by 100k since the ledger was last written. After a
+                 compaction SessionStart left alone (one it could not tell
+                 apart from a running subagent's), it re-injects the ledger.
   statusline     statusLine command: the context against the compaction point
                  and the session's ledger, then model, branch, PR, usage
                  limits and prompt cache.
@@ -40,7 +45,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tnc_context import PLUGIN_NAME, HookError  # noqa: E402
-from tnc_context.ledger import session_start  # noqa: E402
+from tnc_context.ledger import agent_start, agent_stop, session_start  # noqa: E402
 from tnc_context.report import report  # noqa: E402
 from tnc_context.setup import setup  # noqa: E402
 from tnc_context.statusline import statusline  # noqa: E402
@@ -60,6 +65,8 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("session-start")
+    commands.add_parser("agent-start")
+    commands.add_parser("agent-stop")
     commands.add_parser("watch")
     commands.add_parser("statusline")
     grep_parser = commands.add_parser("grep")
@@ -97,6 +104,10 @@ def main(argv: Optional[list] = None) -> int:
             print(statusline(json.load(sys.stdin)))
         elif args.command == "session-start":
             hook_output("SessionStart", session_start(json.load(sys.stdin)))
+        elif args.command == "agent-start":
+            hook_output("SubagentStart", agent_start(json.load(sys.stdin)))
+        elif args.command == "agent-stop":
+            agent_stop(json.load(sys.stdin))
         else:
             event = json.load(sys.stdin)
             hook_output(event["hook_event_name"], watch(event))

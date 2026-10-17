@@ -55,13 +55,14 @@ def test_unexpected_input_is_reported_on_stderr(isolated, monkeypatch, capsys):
 
 def test_the_hooks_call_existing_subcommands():
     hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
-    assert set(hooks) == {"SessionStart", "UserPromptSubmit", "PostToolBatch"}
+    assert set(hooks) == {"SessionStart", "SubagentStart", "SubagentStop", "UserPromptSubmit",
+                          "PostToolBatch"}
     for entries in hooks.values():
         for item in entries:
             for hook in item["hooks"]:
                 command = hook["command"]
                 assert command.startswith('sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" ')
-                assert command.split()[-1] in ("session-start", "watch")
+                assert command.split()[-1] in ("session-start", "agent-start", "agent-stop", "watch")
 
 
 def test_the_commands_call_existing_subcommands():
@@ -146,6 +147,21 @@ def test_the_report_selects_sessions_by_start_date(isolated):
     assert before.startswith("1 sessions, 2 turns") and "sessions above 400k: 1" in before
 
 
+def test_the_report_counts_subagents_apart(isolated):
+    folder = transcripts_dir(isolated["project"])
+    folder.mkdir(parents=True)
+    session_file(folder, "s1", "2026-10-04T09:00:00Z", [100000, 150000])
+    subagents = folder / "s1" / "subagents"
+    subagents.mkdir(parents=True)
+    write_transcript(subagents / "agent-a1.jsonl", [
+        dict(assistant(t, sidechain=True, text=str(i)), timestamp="2026-10-04T09:05:00Z")
+        for i, t in enumerate((40000, 80000, 120000))])
+    text = report(isolated["project"], None, None)
+    assert text.startswith("1 sessions, 2 turns")
+    assert "subagents (not counted above): 1, 3 turns" in text
+    assert "average context 80k, peak max 120k, auto-compactions 0;" in text
+
+
 def test_the_report_of_an_empty_range(isolated):
     transcripts_dir(isolated["project"]).mkdir(parents=True)
     assert report(isolated["project"], dt.date(2030, 1, 1), None).startswith("no sessions")
@@ -183,10 +199,14 @@ def test_each_hook_command_runs_as_written(isolated):
         command = entries[0]["hooks"][0]["command"].replace("${CLAUDE_PLUGIN_ROOT}", ROOT.as_posix())
         event = {"session_id": SESSION, "transcript_path": str(transcript), "hook_event_name": name,
                  "source": "startup", "cwd": str(isolated["project"])}
+        if name in ("SubagentStart", "SubagentStop"):
+            event.update(agent_id="a1b2c3", agent_type="general-purpose")
         result = subprocess.run([SH, "-c", command], input=json.dumps(event), capture_output=True,
                                 encoding="utf-8", check=True)
-        if name == "SessionStart":
-            assert json.loads(result.stdout)["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+        if name in ("SessionStart", "SubagentStart"):
+            assert json.loads(result.stdout)["hookSpecificOutput"]["hookEventName"] == name
+        if name == "SubagentStop":
+            assert result.stdout == ""  # context there would keep the subagent running
 
 
 @pytest.mark.skipif(os.name == "nt", reason="builds a PATH of symlinks")

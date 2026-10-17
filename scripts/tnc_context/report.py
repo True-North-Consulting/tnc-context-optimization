@@ -4,7 +4,8 @@ Costs are relative units (input 1, cache read 0.1, 1-hour cache write 2,
 5-minute cache write 1.25, output 5), so the comparison holds whatever the
 model's price. Sessions are selected by when they started: a session keeps the
 compaction window it started with, so one started before the window was set
-belongs to "before" even if it ran on afterwards.
+belongs to "before" even if it ran on afterwards. Subagents are counted apart,
+under the session that started them.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def transcripts_dir(project: Path) -> Path:
     return config_dir() / "projects" / slug
 
 
-def analyse(path: Path) -> Optional[dict]:
+def analyse(path: Path, sidechain: bool = False) -> Optional[dict]:
     seen = set()
     cost = collections.Counter()
     by_band = collections.Counter()
@@ -43,7 +44,7 @@ def analyse(path: Path) -> Optional[dict]:
             started = record["timestamp"]
         if record.get("type") == "system" and record.get("subtype") == "compact_boundary":
             compactions += 1
-        if record.get("type") != "assistant" or record.get("isSidechain"):
+        if record.get("type") != "assistant" or bool(record.get("isSidechain")) != sidechain:
             continue
         message = record.get("message") or {}
         if message.get("id") in seen:
@@ -68,7 +69,7 @@ def analyse(path: Path) -> Optional[dict]:
         context_sum += context
     if not turns or started is None:
         return None
-    return {"cost": cost, "by_band": by_band, "peak": peak, "turns": turns,
+    return {"path": path, "cost": cost, "by_band": by_band, "peak": peak, "turns": turns,
             "context_sum": context_sum, "compactions": compactions,
             "started": dt.datetime.fromisoformat(started.replace("Z", "+00:00"))}
 
@@ -87,7 +88,7 @@ def report(project: Path, since: Optional[dt.date], until: Optional[dt.date]) ->
     spend = sum(total.values())
     turns = sum(s["turns"] for s in sessions)
     peaks = [s["peak"] for s in sessions if s["peak"] > PROBE_PEAK] or [s["peak"] for s in sessions]
-    return "\n".join([
+    lines = [
         f"{len(sessions)} sessions, {turns} turns, in {folder}",
         f"cost per turn: {spend / turns / 1000:.1f}k units; "
         f"average context {sum(s['context_sum'] for s in sessions) / turns / 1000:.0f}k",
@@ -97,7 +98,21 @@ def report(project: Path, since: Optional[dt.date], until: Optional[dt.date]) ->
         f"peak context per session: median {statistics.median(peaks) // 1000:.0f}k, max {max(peaks) // 1000}k",
         f"sessions above 400k: {sum(p > 400_000 for p in peaks)}; "
         f"auto-compactions: {sum(s['compactions'] for s in sessions)}",
-    ])
+    ]
+    agents = [a for s in sessions
+              for a in (analyse(p, sidechain=True)
+                        for p in sorted((s["path"].with_suffix("") / "subagents").glob("*.jsonl"))) if a]
+    if agents:
+        agent_spend = sum(sum(a["cost"].values()) for a in agents)
+        agent_turns = sum(a["turns"] for a in agents)
+        lines.append(
+            f"subagents (not counted above): {len(agents)}, {agent_turns} turns, "
+            f"cost per turn {agent_spend / agent_turns / 1000:.1f}k units, average context "
+            f"{sum(a['context_sum'] for a in agents) / agent_turns / 1000:.0f}k, "
+            f"peak max {max(a['peak'] for a in agents) // 1000}k, "
+            f"auto-compactions {sum(a['compactions'] for a in agents)}; "
+            f"{100 * agent_spend / (spend + agent_spend):.0f}% of all spend")
+    return "\n".join(lines)
 
 
 def _band(tokens: int) -> str:

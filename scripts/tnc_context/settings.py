@@ -30,17 +30,63 @@ def config_dir() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 
 
-def compact_window(project_dir: Optional[str], model: Optional[str] = None) -> Optional[int]:
+def compact_window(project_dir: Optional[str], model: Optional[str] = None,
+                   own: Optional[int] = None) -> Optional[int]:
     """The auto-compaction window in tokens; None when nothing sets one.
 
     The env var wins, then the settings files from managed to user. Within one
     file a window set for the model in `modelSettings` (what `/autocompact`
     writes) wins over the plain `autoCompactWindow`. The `--autocompact` launch
-    flag is invisible to a hook.
+    flag is invisible to a hook. A subagent inherits that window, or the lower
+    one its definition sets (`own`, from `agent_window`).
     """
     env = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     if env:
         return _window_value(env, "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+    inherited = _settings_window(project_dir, model)
+    if own is None or inherited is None:
+        return inherited if own is None else own
+    return min(own, inherited)
+
+
+def agent_window(project_dir: Optional[str], agent_type: str) -> Optional[int]:
+    """`autoCompactWindow` from the frontmatter of the subagent's definition.
+
+    Project agents shadow user agents of the same name. Built-in and plugin
+    agents have no definition here and inherit the window.
+    """
+    folders = [Path(project_dir, ".claude", "agents")] if project_dir else []
+    folders.append(config_dir() / "agents")
+    for folder in folders:
+        for path in sorted(folder.rglob("*.md")):
+            fields = _frontmatter(path)
+            if fields.get("name", path.stem) != agent_type:
+                continue
+            value = fields.get("autoCompactWindow")
+            return None if value is None else _window_value(value, str(path))
+    return None
+
+
+def _frontmatter(path: Path) -> dict:
+    """The top-level `key: value` lines of a Markdown file's frontmatter."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError:
+        return {}  # no agent definition Claude Code could load either
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fields = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        key, colon, value = line.partition(":")
+        if colon and key and not key[0].isspace():
+            value = value.split(" #", 1)[0]  # a YAML comment
+            fields[key.strip()] = value.strip().strip("\"'")
+    return fields
+
+
+def _settings_window(project_dir: Optional[str], model: Optional[str]) -> Optional[int]:
     files = list(MANAGED_SETTINGS)
     if project_dir:
         files += [
